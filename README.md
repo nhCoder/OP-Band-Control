@@ -5,7 +5,11 @@ OP Band Control is an open-source KernelSU module for inspecting LTE/NR radio st
 > [!WARNING]
 > Radio changes can interrupt mobile data, calls, SMS, IMS/VoLTE, roaming, handover, and emergency connectivity. Do not test while cellular service is your only way to reach emergency services. Keep **Reapply after reboot** off until a specific restriction has been tested thoroughly.
 
-![OP Band Control WebUI](docs/webui-concept.png)
+<p align="center">
+  <a href="docs/webui-concept.png">
+    <img src="docs/webui-concept.png" alt="OP Band Control WebUI" width="320">
+  </a>
+</p>
 
 ## Contents
 
