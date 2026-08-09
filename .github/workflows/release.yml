@@ -159,6 +159,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           MODULE_VERSION: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
