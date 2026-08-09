@@ -1,0 +1,6 @@
+id=opbandcontrol
+name=OP Band Control
+version=0.1.5
+versionCode=105
+author=OP Band Control contributors
+description=Inspect live LTE/NR carriers and request guarded AOSP band selections on OnePlus devices, with CPH2747 catalog validation and automatic rollback.

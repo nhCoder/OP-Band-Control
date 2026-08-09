@@ -1,0 +1,13 @@
+* text=auto
+
+*.sh text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.java text eol=lf
+*.yml text eol=lf
+module.prop text eol=lf
+skip_mount text eol=lf
+
+*.jar binary
+*.png binary
+*.zip binary

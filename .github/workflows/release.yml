@@ -1,0 +1,173 @@
+name: Build and release module
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  build:
+    name: Validate and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    outputs:
+      artifact_name: ${{ steps.version.outputs.artifact_name }}
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platforms;android-35 build-tools;35.0.0'
+          accept-android-sdk-licenses: 'yes'
+          log-accepted-android-sdk-licenses: 'false'
+
+      - name: Verify release metadata
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t module_versions < <(sed -n 's/^version=//p' module.prop)
+          mapfile -t version_codes < <(sed -n 's/^versionCode=//p' module.prop)
+
+          if (( ${#module_versions[@]} != 1 )); then
+            echo 'module.prop must contain exactly one version entry.' >&2
+            exit 1
+          fi
+          if (( ${#version_codes[@]} != 1 )) || [[ ! "${version_codes[0]}" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'module.prop must contain exactly one positive numeric versionCode.' >&2
+            exit 1
+          fi
+
+          module_version=${module_versions[0]}
+          package_version=$(node --input-type=module --eval \
+            "import fs from 'node:fs'; process.stdout.write(JSON.parse(fs.readFileSync('package.json', 'utf8')).version)")
+
+          if [[ ! "$module_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "module.prop version is not a valid x.y.z version: $module_version" >&2
+            exit 1
+          fi
+          if [[ "$package_version" != "$module_version" ]]; then
+            echo "Version mismatch: module.prop=$module_version package.json=$package_version" >&2
+            exit 1
+          fi
+          if ! grep -Fq "./styles/app.css?v=$module_version" webroot/index.html \
+              || ! grep -Fq "./js/app.js?v=$module_version" webroot/index.html; then
+            echo "WebUI cache-busting versions must match module.prop: $module_version" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_TYPE" == 'tag' && "$GITHUB_REF_NAME" != "v$module_version" ]]; then
+            echo "Tag mismatch: expected v$module_version, received $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+          echo "version=$module_version" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=op-band-control-v$module_version" >> "$GITHUB_OUTPUT"
+
+      - name: Validate sources and tests
+        run: npm run check
+
+      - name: Build installable module
+        run: npm run build
+
+      - name: Verify archive and create checksum
+        shell: bash
+        env:
+          MODULE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          archive="op-band-control-v${MODULE_VERSION}.zip"
+          test -f "dist/$archive"
+          unzip -t "dist/$archive"
+
+          embedded_version=$(unzip -p "dist/$archive" module.prop | sed -n 's/^version=//p')
+          if [[ "$embedded_version" != "$MODULE_VERSION" ]]; then
+            echo "Archive version mismatch: expected $MODULE_VERSION, found $embedded_version" >&2
+            exit 1
+          fi
+
+          (
+            cd dist
+            sha256sum "$archive" > "$archive.sha256"
+            sha256sum --check "$archive.sha256"
+          )
+
+      - name: Upload verified module
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.version.outputs.artifact_name }}
+          path: |
+            dist/op-band-control-v${{ steps.version.outputs.version }}.zip
+            dist/op-band-control-v${{ steps.version.outputs.version }}.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  release:
+    name: Publish GitHub release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified module
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: dist
+
+      - name: Verify downloaded checksum
+        shell: bash
+        working-directory: dist
+        run: sha256sum --check "op-band-control-v${{ needs.build.outputs.version }}.zip.sha256"
+
+      - name: Publish release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODULE_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          archive="dist/op-band-control-v${MODULE_VERSION}.zip"
+          checksum="${archive}.sha256"
+          gh release create "$GITHUB_REF_NAME" \
+            "$archive" \
+            "$checksum" \
+            --verify-tag \
+            --title "OP Band Control v${MODULE_VERSION}" \
+            --generate-notes
