@@ -48,8 +48,8 @@ jobs:
         uses: android-actions/setup-android@v4
         with:
           packages: 'platforms;android-35 build-tools;35.0.0'
-          accept-android-sdk-licenses: 'yes'
-          log-accepted-android-sdk-licenses: 'false'
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
 
       - name: Verify release metadata
         id: version

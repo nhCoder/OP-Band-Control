@@ -14,28 +14,18 @@ case "$device_api" in ''|*[!0-9]*) abort 'Could not determine Android API level'
 [ "$device_api" -ge 31 ] || abort 'Android 12 / API 31 or newer is required'
 
 device_arch=${ARCH:-$(getprop ro.product.cpu.abi 2>/dev/null)}
-case "$device_arch" in
-    arm64|arm64-v8a) ;;
-    *) abort "Unsupported architecture: $device_arch (arm64 is required)" ;;
-esac
+[ -n "$device_arch" ] || device_arch=unknown
 
 device_model=$(getprop ro.product.model 2>/dev/null)
 device_maker=$(getprop ro.product.manufacturer 2>/dev/null)
+device_rom=$(getprop ro.build.display.id 2>/dev/null)
 ui_print '***************************************'
-ui_print ' OP Band Control — guarded AOSP backend'
+ui_print ' OP Band Control — guarded Android backend'
 ui_print '***************************************'
 ui_print "- Device: $device_maker $device_model"
 ui_print "- Android API: $device_api"
-
-maker_lower=$(printf '%s' "$device_maker" | tr '[:upper:]' '[:lower:]')
-case "$maker_lower" in
-    *oneplus*) ;;
-    *) ui_print '! Warning: this is not reported as a OnePlus device.' ;;
-esac
-if [ "$device_model" != CPH2747 ]; then
-    ui_print '! CPH2747 identity is not reported. A converted phone may do this.'
-    ui_print '! Verify the physical modem variant before applying any selection.'
-fi
+ui_print "- ABI: $device_arch"
+[ -z "$device_rom" ] || ui_print "- ROM: $device_rom"
 
 [ -s "$MODPATH/bin/opband.jar" ] || abort 'Android helper jar is missing'
 [ -s "$MODPATH/bin/control.sh" ] || abort 'Controller is missing'

@@ -1,21 +1,21 @@
-export const CPH2747_CATALOG = Object.freeze({
-  lte: Object.freeze([1, 2, 3, 4, 5, 7, 8, 12, 13, 17, 18, 19, 20, 25, 26, 28, 30, 32, 34, 38, 39, 40, 41, 42, 48, 66, 71]),
-  nr: Object.freeze([1, 2, 3, 5, 7, 8, 12, 13, 20, 25, 26, 28, 30, 38, 40, 41, 48, 66, 71, 75, 77, 78]),
+// These are standards-based profile hints, not a device support list. Every
+// numbered preset is intersected with bands discovered for the selected SIM.
+// Coverage-oriented operating bands whose standardized downlink allocation is
+// below 1 GHz. The arrays are a profile hint and stay a strict subset of the
+// Android API 35 input policy enforced by the privileged backend.
+export const COVERAGE_CANDIDATES = Object.freeze({
+  lte: Object.freeze([5, 6, 8, 12, 13, 14, 17, 18, 19, 20, 26, 27, 28, 31, 44, 68, 71, 72, 73, 85, 87, 88]),
+  nr: Object.freeze([5, 8, 12, 14, 18, 20, 26, 28, 71]),
 });
 
 export const SUPPLEMENTAL_DOWNLINK = Object.freeze({
-  lte: Object.freeze([32]),
-  nr: Object.freeze([75]),
+  lte: Object.freeze([29, 32, 67, 69]),
+  nr: Object.freeze([29, 75, 76]),
 });
 
-export const COVERAGE_BANDS = Object.freeze({
-  lte: Object.freeze([5, 8, 12, 13, 17, 18, 19, 20, 26, 28, 71]),
-  nr: Object.freeze([5, 8, 12, 13, 20, 26, 28, 71]),
-});
-
-export const CAPACITY_BANDS = Object.freeze({
-  lte: Object.freeze([1, 2, 3, 4, 7, 25, 30, 38, 39, 40, 41, 42, 48, 66]),
-  nr: Object.freeze([1, 2, 3, 7, 25, 30, 38, 40, 41, 48, 66, 77, 78]),
+export const SUPPLEMENTAL_UPLINK = Object.freeze({
+  lte: Object.freeze([]),
+  nr: Object.freeze([80, 81, 82, 83, 84, 86, 89, 95]),
 });
 
 export const PROFILES = Object.freeze([
@@ -25,15 +25,15 @@ export const PROFILES = Object.freeze([
     name: 'Adaptive',
     shortName: 'Adaptive',
     description: 'Clears band restrictions so the modem and network can adapt as conditions change.',
-    effect: 'Automatic bands · LTE and NR available',
+    effect: 'Automatic bands · LTE and NR remain eligible',
   }),
   Object.freeze({
     id: 'coverage',
     backendId: 'coverage',
-    name: 'Coverage',
-    shortName: 'Coverage',
-    description: 'Selects lower-frequency candidates from this device catalog for range and stability.',
-    effect: 'Regional availability still varies',
+    name: 'Coverage candidate',
+    shortName: 'Coverage candidate',
+    description: 'Uses only lower-frequency candidates discovered for the selected SIM.',
+    effect: 'Availability depends on runtime-discovered bands',
   }),
   Object.freeze({
     id: 'lte-plus',
@@ -49,8 +49,8 @@ export const PROFILES = Object.freeze([
     backendId: 'nsa',
     name: '5G NSA candidate',
     shortName: '5G NSA candidate',
-    description: 'Keeps at least one LTE anchor and selected NR carriers eligible for dual connectivity.',
-    effect: 'Requires carrier-side NSA and a compatible LTE anchor',
+    description: 'Uses discovered LTE and NR candidates for a guarded dual-connectivity request.',
+    effect: 'Requires a discovered LTE anchor and non-supplemental NR candidate',
   }),
 ]);
 
@@ -61,7 +61,7 @@ export function getProfile(id) {
       backendId: 'custom',
       name: 'Custom selection',
       shortName: 'Custom selection',
-      description: 'Uses the LTE and NR bands selected on the Bands page.',
+      description: 'Uses the LTE and NR candidates selected on the Bands page.',
       effect: 'Experimental band scan restriction',
     };
   }
@@ -82,11 +82,96 @@ export function uiProfileId(id) {
   return match ? match.id : 'adaptive';
 }
 
+export function deriveBandCandidates({ serving = [], observed = {}, selection = {}, cached = {} } = {}) {
+  const activeLte = serving.filter((item) => item?.rat === 'LTE').map((item) => item.band);
+  const activeNr = serving.filter((item) => item?.rat === 'NR').map((item) => item.band);
+  const lte = uniqueBands([
+    ...toBandArray(cached.lte),
+    ...toBandArray(observed.lte),
+    ...toBandArray(selection.lte),
+    ...activeLte,
+  ]);
+  const nr = uniqueBands([
+    ...toBandArray(cached.nr),
+    ...toBandArray(observed.nr),
+    ...toBandArray(selection.nr),
+    ...activeNr,
+  ]);
+  const count = lte.length + nr.length;
+  return {
+    lte,
+    nr,
+    source: count
+      ? 'Runtime-discovered and cached candidates for this SIM'
+      : 'No runtime band candidates discovered for this SIM',
+  };
+}
+
+export function profilePreset(id, catalog = {}) {
+  const availableLte = uniqueBands(catalog.lte);
+  const availableNr = uniqueBands(catalog.nr);
+
+  if (id === 'adaptive' || id === 'lte-plus') {
+    return { available: true, lte: [], nr: [], reason: '' };
+  }
+
+  if (id === 'coverage') {
+    const lte = intersect(COVERAGE_CANDIDATES.lte, availableLte);
+    const nr = intersect(COVERAGE_CANDIDATES.nr, availableNr);
+    const available = lte.length + nr.length > 0;
+    return {
+      available,
+      lte: available ? lte : [],
+      nr: available ? nr : [],
+      reason: available ? '' : 'No discovered coverage-band candidate is available for this SIM yet.',
+    };
+  }
+
+  if (id === 'nsa') {
+    const anchorLte = availableLte.filter((band) => !SUPPLEMENTAL_DOWNLINK.lte.includes(band));
+    const ordinaryNr = availableNr.filter((band) => !isSupplementalOnly('nr', band));
+    const available = anchorLte.length > 0 && ordinaryNr.length > 0;
+    return {
+      available,
+      lte: available ? availableLte : [],
+      nr: available ? availableNr : [],
+      reason: available ? '' : 'Needs at least one discovered LTE anchor and one non-supplemental NR candidate for this SIM.',
+    };
+  }
+
+  const available = availableLte.length + availableNr.length > 0;
+  return {
+    available,
+    lte: available ? availableLte : [],
+    nr: available ? availableNr : [],
+    reason: available ? '' : 'No selectable band candidate has been discovered for this SIM yet.',
+  };
+}
+
 export function intersect(values, available) {
   const allowed = new Set(available);
   return values.filter((value) => allowed.has(value));
 }
 
+export function isSupplementalOnly(rat, band) {
+  return SUPPLEMENTAL_DOWNLINK[rat]?.includes(band)
+    || SUPPLEMENTAL_UPLINK[rat]?.includes(band)
+    || false;
+}
+
+export function filterByInputPolicy(catalog = {}, inputPolicy = {}) {
+  return {
+    lte: intersect(uniqueBands(catalog.lte), uniqueBands(inputPolicy.lte)),
+    nr: intersect(uniqueBands(catalog.nr), uniqueBands(inputPolicy.nr)),
+  };
+}
+
 export function uniqueBands(values) {
   return [...new Set((values || []).map(Number).filter((value) => Number.isInteger(value) && value > 0 && value <= 261))].sort((a, b) => a - b);
+}
+
+function toBandArray(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string') return value.split(/[,\s:]+/);
+  return [];
 }

@@ -4,6 +4,7 @@ import test from 'node:test';
 
 const app = readFileSync(new URL('../webroot/js/app.js', import.meta.url), 'utf8');
 const api = readFileSync(new URL('../webroot/js/api.js', import.meta.url), 'utf8');
+const catalog = readFileSync(new URL('../webroot/js/catalog.js', import.meta.url), 'utf8');
 const css = readFileSync(new URL('../webroot/styles/app.css', import.meta.url), 'utf8');
 
 test('routine polling patches live fields without rebuilding the app root', () => {
@@ -36,6 +37,26 @@ test('preview dual-SIM status honors the requested subscription', () => {
   assert.match(api, /mockStatus\(state, requestedSubId\)/);
   assert.match(api, /return mockStatus\(state, rest\[0\]\)/);
   assert.match(api, /\[1, 2\]\.includes\(numericSubId\)/);
+});
+
+test('band controls use per-SIM runtime discovery instead of a model catalog', () => {
+  const combined = `${app}\n${api}\n${catalog}`;
+  assert.doesNotMatch(combined, /CPH2747|OnePlus certified|OxygenOS|conversionHint/);
+  assert.doesNotMatch(app, /raw\.catalog/);
+  assert.match(app, /raw\.discoveredBands/);
+  assert.match(app, /deriveBandCandidates\(\{/);
+  assert.match(app, /selection:\s*\{[\s\S]*lte: uniqueBands\(\[\.\.\.status\.selection\.lte, \.\.\.lte\]\)/);
+  assert.match(app, /Runtime-discovered|runtime band candidates/);
+  assert.match(app, /not a complete hardware-support list/);
+  assert.match(app, /filterByInputPolicy\(status\?\.catalog, status\?\.inputPolicy\)/);
+  assert.match(app, /Monitor only/);
+});
+
+test('numbered profiles are disabled when discovered candidates are insufficient', () => {
+  assert.match(app, /const preset = profilePreset\(profile\.id, selectableCatalog\(status\)\)/);
+  assert.match(app, /preset\.available \? '' : 'disabled'/);
+  assert.match(catalog, /lte: available \? availableLte : \[\]/);
+  assert.match(catalog, /Needs at least one discovered LTE anchor and one non-supplemental NR candidate/);
 });
 
 test('preview LTE+ safeguard clears stale mock restrictions without a watchdog', () => {

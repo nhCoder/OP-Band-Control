@@ -13,13 +13,15 @@ import {
 } from './api.js';
 import {
   backendProfileId,
-  COVERAGE_BANDS,
-  CPH2747_CATALOG,
+  deriveBandCandidates,
+  filterByInputPolicy,
   getProfile,
-  intersect,
+  isSupplementalOnly,
+  profilePreset,
   profileOperation,
   PROFILES,
   SUPPLEMENTAL_DOWNLINK,
+  SUPPLEMENTAL_UPLINK,
   uiProfileId,
   uniqueBands,
 } from './catalog.js';
@@ -46,6 +48,7 @@ const state = {
   signalHistory: [],
   pendingToken: '',
   rollbackAt: 0,
+  candidateCache: new Map(),
 };
 
 let refreshTimer = 0;
@@ -91,6 +94,7 @@ async function loadDashboard(subId, initial = false, guardToken = 0) {
 
   const savedLte = savedForSelectedSubscription ? settings.lte : status.selection.lte;
   const savedNr = savedForSelectedSubscription ? settings.nr : status.selection.nr;
+  includeCandidateBands(status, savedLte, savedNr);
   state.selected = {
     lte: new Set(savedLte),
     nr: new Set(savedNr),
@@ -119,7 +123,13 @@ async function refreshDashboard() {
 
     const nextStatus = normalizeStatus(rawStatus);
     const nextSettings = normalizeSettings(rawSettings);
+    const settingsForSelectedSubscription = nextSettings.subId === nextStatus.selectedSubId;
+    const savedForSelectedSubscription = settingsForSelectedSubscription && nextSettings.applied;
+    const selectedLte = savedForSelectedSubscription ? nextSettings.lte : nextStatus.selection.lte;
+    const selectedNr = savedForSelectedSubscription ? nextSettings.nr : nextStatus.selection.nr;
+    includeCandidateBands(nextStatus, selectedLte, selectedNr);
     const subscriptionChanged = nextStatus.selectedSubId !== requestedSubId;
+    const candidatesChanged = catalogKey(state.status.catalog) !== catalogKey(nextStatus.catalog);
     state.status = nextStatus;
     state.settings = nextSettings;
     state.selectedSubId = nextStatus.selectedSubId;
@@ -131,18 +141,16 @@ async function refreshDashboard() {
     }
 
     if (!state.dirty) {
-      const settingsForSelectedSubscription = nextSettings.subId === nextStatus.selectedSubId;
-      const savedForSelectedSubscription = settingsForSelectedSubscription && nextSettings.applied;
       state.profile = uiProfileId(settingsForSelectedSubscription
         ? nextSettings.profile
         : nextStatus.selection.auto ? 'adaptive' : 'custom');
       state.selected = {
-        lte: new Set(savedForSelectedSubscription ? nextSettings.lte : nextStatus.selection.lte),
-        nr: new Set(savedForSelectedSubscription ? nextSettings.nr : nextStatus.selection.nr),
+        lte: new Set(selectedLte),
+        nr: new Set(selectedNr),
       };
     }
 
-    let requiresRender = subscriptionChanged;
+    let requiresRender = subscriptionChanged || candidatesChanged;
     let rolledBack = false;
     if (!nextSettings.pendingToken && state.pendingToken && state.modal?.type === 'pending') {
       state.pendingToken = '';
@@ -247,7 +255,7 @@ function patchLiveDashboard(status, settings) {
   patchOverview(status);
   syncSubscriptionSelectors();
   patchBandControls(status);
-  patchProfileControls(settings);
+  patchProfileControls(status, settings);
   patchCapabilityCallouts(status.capability);
   patchActionDock(status.capability);
   patchBusyOverlay();
@@ -365,11 +373,18 @@ function patchBandControls(status) {
     const isObserved = observed[rat].has(band);
     const isServing = serving[rat].has(band);
     const sdl = SUPPLEMENTAL_DOWNLINK[rat].includes(band);
+    const sul = SUPPLEMENTAL_UPLINK[rat].includes(band);
+    const policyAllowed = bandAllowed(status, rat, band);
+    const origin = candidateOrigin(status, rat, band);
+    const displayOrigin = policyAllowed ? origin : `${origin} · Monitor only`;
     button.setAttribute('aria-pressed', String(isSelected));
+    button.disabled = !policyAllowed && !isSelected;
+    button.dataset.policyAllowed = String(policyAllowed);
     button.setAttribute(
       'aria-label',
-      `${rat === 'nr' ? 'NR n' : 'LTE B'}${band}${sdl ? ', supplemental downlink' : ''}${isServing ? ', active now' : isObserved ? ', observed nearby' : ''}`,
+      `${rat === 'nr' ? 'NR n' : 'LTE B'}${band}${sdl ? ', supplemental downlink' : ''}${sul ? ', supplemental uplink' : ''}, ${displayOrigin.toLowerCase()}`,
     );
+    setText(button.querySelector('.candidate-origin'), displayOrigin);
     const markers = button.querySelectorAll('.tiny-marker');
     if (markers[0]) markers[0].dataset.active = String(isObserved);
     if (markers[1]) markers[1].dataset.active = String(isServing);
@@ -382,9 +397,12 @@ function patchBandControls(status) {
   });
 }
 
-function patchProfileControls(settings) {
+function patchProfileControls(status, settings) {
   document.querySelectorAll('[data-profile]').forEach((button) => {
+    const preset = profilePreset(button.dataset.profile, selectableCatalog(status));
     button.setAttribute('aria-pressed', String(button.dataset.profile === state.profile));
+    button.disabled = !preset.available;
+    button.setAttribute('aria-disabled', String(!preset.available));
   });
   const reapply = document.querySelector('[data-action="reapply"]');
   const available = settings.subId === state.selectedSubId && settings.applied;
@@ -394,9 +412,9 @@ function patchProfileControls(settings) {
 
 function patchCapabilityCallouts(capability) {
   const mode = capability.write ? 'ok' : 'error';
-  const heading = capability.write ? 'Band API detected' : 'Read-only on this firmware';
+  const heading = capability.write ? 'Selection path available' : 'Read-only on this firmware';
   const copy = capability.write
-    ? `${capability.reason || 'Android radio selection APIs are available.'} Writes remain experimental until verified on this exact OxygenOS build.`
+    ? `${capability.reason || 'Android radio selection APIs are available.'} Writes remain experimental until verified on this exact firmware build.`
     : `${capability.reason || 'The radio selection API could not be verified.'} Live monitoring remains available; apply controls are disabled.`;
   const key = JSON.stringify([mode, heading, copy]);
   const content = `
@@ -409,10 +427,11 @@ function patchCapabilityCallouts(capability) {
 }
 
 function patchActionDock(capability) {
-  const disabled = !(capability.write && state.selectedSubId >= 0);
-  document.querySelectorAll('[data-action="reset-open"], [data-action="review"]').forEach((button) => {
-    button.disabled = disabled;
-  });
+  const canMutate = capability.write && state.selectedSubId >= 0;
+  const reset = document.querySelector('[data-action="reset-open"]');
+  const review = document.querySelector('[data-action="review"]');
+  if (reset) reset.disabled = !canMutate;
+  if (review) review.disabled = !(canMutate && currentProfileAvailable());
 }
 
 function patchBusyOverlay() {
@@ -541,16 +560,13 @@ function renderBands(status) {
   const observedNr = new Set(status.observed.nr);
   const servingLte = new Set(status.serving.filter((item) => item.rat === 'LTE').map((item) => item.band));
   const servingNr = new Set(status.serving.filter((item) => item.rat === 'NR').map((item) => item.band));
-  const source = status.catalog.source || 'Observed radio data';
-  const deviceCaveat = status.device.conversionHint
-    ? ` ${status.device.conversionHint}`
-    : '';
+  const source = status.catalog.source || 'No runtime band candidates discovered for this SIM';
 
   return `
     <div class="section-header">
       <div>
-        <h2 class="section-title">Available bands</h2>
-        <p class="section-copy">Select bands for an experimental scan restriction. A selected band is eligible—not guaranteed to serve or aggregate.</p>
+        <h2 class="section-title">Discovered band candidates</h2>
+        <p class="section-copy">Select from bands reported at runtime for this SIM. This is not a complete hardware-support list, and a selected band is eligible—not guaranteed to serve or aggregate.</p>
       </div>
     </div>
 
@@ -558,20 +574,20 @@ function renderBands(status) {
 
     <p class="source-note">
       ${icon('info', 18)}
-      <span><strong>${escapeHtml(source)}.</strong> Green markers mean observed nearby; selected red controls are requested restrictions; the live stack shows active carriers.${escapeHtml(deviceCaveat)}</span>
+      <span><strong>${escapeHtml(source)}.</strong> New candidates can appear as the radio reports them. A detected band outside this build’s Android input policy remains visible as monitor-only.</span>
     </p>
 
-    ${renderBandGroup('NR', status.catalog.nr, state.selected.nr, observedNr, servingNr)}
-    ${renderBandGroup('LTE', status.catalog.lte, state.selected.lte, observedLte, servingLte)}
+    ${renderBandGroup('NR', status.catalog.nr, state.selected.nr, observedNr, servingNr, status)}
+    ${renderBandGroup('LTE', status.catalog.lte, state.selected.lte, observedLte, servingLte, status)}
 
     <div class="warning-callout">
       ${icon('warning', 19)}
-      <span>B32 and n75 are supplemental-downlink bands and cannot be the only anchor. The module blocks unsafe sole-SDL selections.</span>
+      <span>One-way supplemental bands (SDL or SUL) cannot form a usable request by themselves. Monitor-only candidates are visible but cannot be added to a new request.</span>
     </div>
   `;
 }
 
-function renderBandGroup(rat, bands, selected, observed, serving) {
+function renderBandGroup(rat, bands, selected, observed, serving, status) {
   const key = rat === 'NR' ? 'nr' : 'lte';
   return `
     <section class="band-group" aria-labelledby="${key}-heading">
@@ -580,27 +596,33 @@ function renderBandGroup(rat, bands, selected, observed, serving) {
         <span class="band-count">${selected.size} of ${bands.length} selected</span>
       </div>
       <div class="band-selector">
-        ${bands.map((band) => {
+        ${bands.length ? bands.map((band) => {
           const isSelected = selected.has(band);
           const isObserved = observed.has(band);
           const isServing = serving.has(band);
           const sdl = SUPPLEMENTAL_DOWNLINK[key].includes(band);
+          const sul = SUPPLEMENTAL_UPLINK[key].includes(band);
+          const policyAllowed = bandAllowed(status, key, band);
+          const origin = candidateOrigin(status, key, band);
+          const displayOrigin = policyAllowed ? origin : `${origin} · Monitor only`;
           return `
             <button
               class="band-option"
               type="button"
               data-band-rat="${key}"
               data-band="${band}"
+              data-policy-allowed="${policyAllowed}"
               aria-pressed="${isSelected}"
-              aria-label="${rat === 'NR' ? 'NR n' : 'LTE B'}${band}${sdl ? ', supplemental downlink' : ''}${isServing ? ', active now' : isObserved ? ', observed nearby' : ''}"
+              aria-label="${rat === 'NR' ? 'NR n' : 'LTE B'}${band}${sdl ? ', supplemental downlink' : ''}${sul ? ', supplemental uplink' : ''}, ${escapeHtml(displayOrigin.toLowerCase())}"
+              ${policyAllowed || isSelected ? '' : 'disabled'}
             >
-              <span>${rat === 'NR' ? 'n' : 'B'}${band}${sdl ? '<small> SDL</small>' : ''}</span>
+              <span class="band-identity"><span>${rat === 'NR' ? 'n' : 'B'}${band}${sdl ? '<small> SDL</small>' : sul ? '<small> SUL</small>' : ''}</span><small class="candidate-origin">${escapeHtml(displayOrigin)}</small></span>
               <span>
                 <span class="band-check">${icon('check', 12)}</span>
                 <span class="band-markers" aria-hidden="true"><i class="tiny-marker" data-active="${isObserved}"></i><i class="tiny-marker" data-active="${isServing}"></i></span>
               </span>
             </button>`;
-        }).join('')}
+        }).join('') : `<p class="band-empty">No ${rat} candidate has been reported for this SIM yet.</p>`}
       </div>
     </section>
   `;
@@ -620,16 +642,18 @@ function renderProfiles(status, settings) {
     ${renderSubscriptionToolbar(status, 'profiles-subscription', 'Apply profile to')}
 
     <div class="profile-list">
-      ${PROFILES.map((profile) => `
-        <button class="profile-option" type="button" data-profile="${profile.id}" aria-pressed="${state.profile === profile.id}">
+      ${PROFILES.map((profile) => {
+        const preset = profilePreset(profile.id, selectableCatalog(status));
+        return `
+        <button class="profile-option" type="button" data-profile="${profile.id}" aria-pressed="${state.profile === profile.id}" aria-disabled="${!preset.available}" ${preset.available ? '' : 'disabled'}>
           <span class="profile-radio" aria-hidden="true"></span>
           <span>
             <span class="profile-name">${escapeHtml(profile.name)}</span>
             <span class="profile-description">${escapeHtml(profile.description)}</span>
-            <span class="profile-effect">${escapeHtml(profile.effect)}</span>
+            <span class="profile-effect">${escapeHtml(preset.available ? profile.effect : `Unavailable · ${preset.reason}`)}</span>
           </span>
         </button>
-      `).join('')}
+      `;}).join('')}
     </div>
 
     ${state.profile === 'custom' ? `
@@ -676,9 +700,9 @@ function renderLogs() {
 
 function renderCapability(capability) {
   const mode = capability.write ? 'ok' : 'error';
-  const heading = capability.write ? 'Band API detected' : 'Read-only on this firmware';
+  const heading = capability.write ? 'Selection path available' : 'Read-only on this firmware';
   const copy = capability.write
-    ? `${capability.reason || 'Android radio selection APIs are available.'} Writes remain experimental until verified on this exact OxygenOS build.`
+    ? `${capability.reason || 'Android radio selection APIs are available.'} Writes remain experimental until verified on this exact firmware build.`
     : `${capability.reason || 'The radio selection API could not be verified.'} Live monitoring remains available; apply controls are disabled.`;
   return `
     <div class="capability-callout" data-live="capability" data-state="${mode}">
@@ -690,13 +714,14 @@ function renderCapability(capability) {
 
 function renderActionDock(capability) {
   const canMutate = capability.write && state.selectedSubId >= 0;
+  const canReview = canMutate && currentProfileAvailable();
   return `
     <div class="action-dock">
       <div class="action-inner">
         <button class="button button--secondary" type="button" data-action="reset-open" ${canMutate ? '' : 'disabled'}>
           ${icon('refresh', 18)} Restore defaults
         </button>
-        <button class="button button--primary" type="button" data-action="review" ${canMutate ? '' : 'disabled'}>
+        <button class="button button--primary" type="button" data-action="review" ${canReview ? '' : 'disabled'}>
           ${icon('clipboard', 18)} Review & apply
         </button>
       </div>
@@ -783,14 +808,15 @@ function renderModal() {
         <button class="sheet-close" type="button" data-action="modal-close">Close</button>
       </div>
       <dl class="review-table">
+        <div class="review-row"><dt>Manufacturer</dt><dd>${escapeHtml(device.manufacturer || 'Unknown')}</dd></div>
         <div class="review-row"><dt>Reported model</dt><dd>${escapeHtml(device.model || 'Unknown')}</dd></div>
         <div class="review-row"><dt>Product</dt><dd>${escapeHtml(device.product || 'Unknown')}</dd></div>
         <div class="review-row"><dt>Android</dt><dd>${escapeHtml(`${device.release || 'Unknown'} · API ${device.sdk || '—'}`)}</dd></div>
-        <div class="review-row"><dt>Catalog</dt><dd>${escapeHtml(state.status.catalog.source)}</dd></div>
+        <div class="review-row"><dt>Band candidates</dt><dd>${escapeHtml(state.status.catalog.source)}</dd></div>
       </dl>
-      <div class="warning-callout">
-        ${icon('warning', 19)}
-        <span>${escapeHtml(`${device.conversionHint ? `${device.conversionHint}. ` : ''}A reported CPH2747 model does not by itself prove the original RF hardware SKU. Global firmware cannot add antennas, filters, calibration, or certification missing from converted hardware.`)}</span>
+      <div class="source-note">
+        ${icon('info', 19)}
+        <span>Device identity is reported by Android. Band candidates are learned from runtime radio data and the current selection; they are not a claim of complete hardware support.</span>
       </div>
       <p class="section-copy">This module uses Android’s system-selection channel API only. It never writes DIAG NV/EFS, IMEI, calibration, carrier policy, or persist.radio properties, and it never makes SELinux permissive.</p>
     `);
@@ -863,6 +889,10 @@ async function switchTab(tab) {
 function toggleBand(rat, band) {
   if (!['lte', 'nr'].includes(rat) || !Number.isInteger(band)) return;
   const selection = state.selected[rat];
+  if (!bandAllowed(state.status, rat, band) && !selection.has(band)) {
+    showToast('This detected band is monitor-only under the current Android input policy.', 'error');
+    return;
+  }
   if (selection.has(band)) selection.delete(band);
   else selection.add(band);
   state.profile = 'custom';
@@ -871,28 +901,16 @@ function toggleBand(rat, band) {
 }
 
 function chooseProfile(profileId) {
-  state.profile = profileId;
-  const status = state.status;
-  const activeLte = uniqueBands(status.serving.filter((item) => item.rat === 'LTE').map((item) => item.band));
-  const activeNr = uniqueBands(status.serving.filter((item) => item.rat === 'NR').map((item) => item.band));
-  const observedLte = uniqueBands([...activeLte, ...status.observed.lte]);
-  const observedNr = uniqueBands([...activeNr, ...status.observed.nr]);
-
-  if (profileId === 'adaptive') {
-    state.selected = { lte: new Set(), nr: new Set() };
-  } else if (profileId === 'coverage') {
-    state.selected = {
-      lte: new Set(intersect(COVERAGE_BANDS.lte, observedLte)),
-      nr: new Set(intersect(COVERAGE_BANDS.nr, observedNr)),
-    };
-  } else if (profileId === 'lte-plus') {
-    state.selected = { lte: new Set(), nr: new Set() };
-  } else if (profileId === 'nsa') {
-    state.selected = {
-      lte: new Set(observedLte),
-      nr: new Set(observedNr),
-    };
+  const preset = profilePreset(profileId, selectableCatalog(state.status));
+  if (!preset.available) {
+    showToast(preset.reason, 'error');
+    return;
   }
+  state.profile = profileId;
+  state.selected = {
+    lte: new Set(preset.lte),
+    nr: new Set(preset.nr),
+  };
   state.dirty = true;
   render();
 }
@@ -1231,12 +1249,26 @@ async function copyLogs() {
 
 function validateRequested() {
   if (state.selectedSubId < 0) return 'No active SIM was detected.';
+  if (!currentProfileAvailable()) {
+    return state.profile === 'custom'
+      ? 'Select at least one discovered LTE or NR candidate.'
+      : profilePreset(state.profile, selectableCatalog(state.status)).reason;
+  }
   return validateSelection({
     canWrite: state.status.capability.write,
     profile: state.profile,
     lte: [...state.selected.lte],
     nr: [...state.selected.nr],
+    inputPolicy: state.status.inputPolicy,
   });
+}
+
+function currentProfileAvailable() {
+  if (!state.status) return false;
+  if (state.profile === 'custom') {
+    return state.selected.lte.size + state.selected.nr.size > 0;
+  }
+  return profilePreset(state.profile, selectableCatalog(state.status)).available;
 }
 
 function startPendingTimer() {
@@ -1310,14 +1342,39 @@ function normalizeStatus(raw = {}) {
   serving.sort((a, b) => Number(b.rat === 'NR') - Number(a.rat === 'NR') || Number(b.primary) - Number(a.primary));
 
   const observed = raw.observed || {};
-  const catalog = raw.catalog || {};
+  const discoveredRaw = raw.discoveredBands || {};
+  const discoveredServing = discoveredRaw.serving || {};
+  const discoveredObserved = discoveredRaw.observed || {};
+  const discoveredSelection = discoveredRaw.selection || {};
+  const discoveredAll = discoveredRaw.all || {};
+  const inputPolicyRaw = raw.inputPolicy || {};
   const model = stringValue(device.model ?? raw.model ?? 'Unknown device');
-  const isReportedCph = /CPH2747/i.test(model);
-  const fallbackCatalog = isReportedCph ? CPH2747_CATALOG : {
-    lte: uniqueBands([...serving.filter((item) => item.rat === 'LTE').map((item) => item.band), ...parseBands(observed.lte)]),
-    nr: uniqueBands([...serving.filter((item) => item.rat === 'NR').map((item) => item.band), ...parseBands(observed.nr)]),
+  const selectionRaw = raw.selection || raw.currentSelection || {};
+  const selectionLte = uniqueBands([...parseBands(selectionRaw.lte), ...parseBands(discoveredSelection.lte)]);
+  const selectionNr = uniqueBands([...parseBands(selectionRaw.nr), ...parseBands(discoveredSelection.nr)]);
+  const hasExplicitSelection = selectionLte.length + selectionNr.length > 0;
+  const selection = {
+    auto: hasExplicitSelection ? false : Boolean(selectionRaw.auto ?? selectionRaw.isAuto ?? true),
+    lte: selectionLte,
+    nr: selectionNr,
   };
-  const selection = raw.selection || raw.currentSelection || {};
+  const normalizedObserved = {
+    lte: uniqueBands([...parseBands(observed.lte), ...parseBands(discoveredObserved.lte), ...serving.filter((item) => item.rat === 'LTE').map((item) => item.band)]),
+    nr: uniqueBands([...parseBands(observed.nr), ...parseBands(discoveredObserved.nr), ...serving.filter((item) => item.rat === 'NR').map((item) => item.band)]),
+  };
+  const cachedCandidates = state.candidateCache.get(selectedSubId) || { lte: [], nr: [] };
+  const candidates = deriveBandCandidates({
+    serving,
+    observed: normalizedObserved,
+    selection,
+    cached: {
+      lte: uniqueBands([...cachedCandidates.lte, ...parseBands(discoveredAll.lte), ...parseBands(discoveredServing.lte)]),
+      nr: uniqueBands([...cachedCandidates.nr, ...parseBands(discoveredAll.nr), ...parseBands(discoveredServing.nr)]),
+    },
+  });
+  if (selectedSubId >= 0) {
+    state.candidateCache.set(selectedSubId, { lte: candidates.lte, nr: candidates.nr });
+  }
   const capabilityRaw = raw.capability || raw.capabilities || {};
   const write = Boolean(capabilityRaw.write ?? capabilityRaw.canWrite ?? capabilityRaw.setSupported ?? raw.writeSupported);
   const read = Boolean(capabilityRaw.read ?? capabilityRaw.canRead ?? true);
@@ -1332,11 +1389,10 @@ function normalizeStatus(raw = {}) {
     device: {
       model,
       product: stringValue(device.product ?? device.device ?? raw.product),
-      manufacturer: stringValue(device.manufacturer ?? 'OnePlus'),
+      manufacturer: stringValue(device.manufacturer ?? raw.manufacturer ?? 'Unknown'),
       sdk: finiteNumber(device.sdk ?? raw.sdk, 0),
       release: stringValue(device.release ?? raw.release),
       rom: stringValue(device.rom ?? device.os ?? raw.rom),
-      conversionHint: stringValue(device.conversionHint ?? raw.conversionHint),
     },
     subscriptions,
     selectedSubId,
@@ -1346,20 +1402,26 @@ function normalizeStatus(raw = {}) {
     signalLevel: overallSignalLevel,
     carrierAggregationActive,
     serving,
-    observed: {
-      lte: uniqueBands([...parseBands(observed.lte), ...serving.filter((item) => item.rat === 'LTE').map((item) => item.band)]),
-      nr: uniqueBands([...parseBands(observed.nr), ...serving.filter((item) => item.rat === 'NR').map((item) => item.band)]),
+    discovered: {
+      serving: {
+        lte: uniqueBands([...parseBands(discoveredServing.lte), ...serving.filter((item) => item.rat === 'LTE').map((item) => item.band)]),
+        nr: uniqueBands([...parseBands(discoveredServing.nr), ...serving.filter((item) => item.rat === 'NR').map((item) => item.band)]),
+      },
+      observed: normalizedObserved,
+      selection: { lte: selection.lte, nr: selection.nr },
     },
-    catalog: {
-      lte: uniqueBands(parseBands(catalog.lte).length ? parseBands(catalog.lte) : fallbackCatalog.lte),
-      nr: uniqueBands(parseBands(catalog.nr).length ? parseBands(catalog.nr) : fallbackCatalog.nr),
-      source: stringValue(catalog.source || (isReportedCph ? 'OnePlus certified CPH2747 catalog · reported model unverified' : 'Observed nearby only')),
+    observed: normalizedObserved,
+    catalog: candidates,
+    inputPolicy: {
+      lte: uniqueBands(parseBands(inputPolicyRaw.lte)),
+      nr: uniqueBands(parseBands(inputPolicyRaw.nr)),
+      supplementalDownlinkLte: uniqueBands(parseBands(inputPolicyRaw.supplementalDownlinkLte)),
+      supplementalDownlinkNr: uniqueBands(parseBands(inputPolicyRaw.supplementalDownlinkNr)),
+      supplementalUplinkNr: uniqueBands(parseBands(inputPolicyRaw.supplementalUplinkNr)),
+      basis: stringValue(inputPolicyRaw.basis || 'No mutation input policy was reported'),
+      deviceCapabilityClaim: Boolean(inputPolicyRaw.deviceCapabilityClaim),
     },
-    selection: {
-      auto: Boolean(selection.auto ?? selection.isAuto ?? (!parseBands(selection.lte).length && !parseBands(selection.nr).length)),
-      lte: parseBands(selection.lte),
-      nr: parseBands(selection.nr),
-    },
+    selection,
     capability: {
       read,
       write,
@@ -1367,6 +1429,45 @@ function normalizeStatus(raw = {}) {
       experimental: true,
     },
   };
+}
+
+function includeCandidateBands(status, lte, nr) {
+  const candidates = deriveBandCandidates({
+    serving: status.serving,
+    observed: status.observed,
+    selection: {
+      lte: uniqueBands([...status.selection.lte, ...lte]),
+      nr: uniqueBands([...status.selection.nr, ...nr]),
+    },
+    cached: status.catalog,
+  });
+  status.catalog = candidates;
+  if (status.selectedSubId >= 0) {
+    state.candidateCache.set(status.selectedSubId, { lte: candidates.lte, nr: candidates.nr });
+  }
+}
+
+function catalogKey(catalog = {}) {
+  return `${uniqueBands(catalog.lte).join(',')}|${uniqueBands(catalog.nr).join(',')}`;
+}
+
+function selectableCatalog(status) {
+  return filterByInputPolicy(status?.catalog, status?.inputPolicy);
+}
+
+function bandAllowed(status, rat, band) {
+  return status?.inputPolicy?.[rat]?.includes(band) === true;
+}
+
+function candidateOrigin(status, rat, band) {
+  const radioRat = rat === 'nr' ? 'NR' : 'LTE';
+  const labels = [];
+  if (status.serving.some((item) => item.rat === radioRat && item.band === band)) labels.push('Active now');
+  else if (status.discovered.serving[rat].includes(band)) labels.push('Serving report');
+  if (status.selection[rat].includes(band)) labels.push('Current selection');
+  if (labels.length) return labels.join(' · ');
+  if (status.observed[rat].includes(band)) return 'Observed / cached';
+  return 'Session cache';
 }
 
 function normalizeSettings(raw = {}) {

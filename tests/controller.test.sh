@@ -48,11 +48,21 @@ expect_failure() {
     }
 }
 
-expect_failure 65 UNSAFE_SDL_ONLY apply 1 32 - custom
-expect_failure 65 UNSAFE_SDL_ONLY apply 1 - 75 custom
+expect_failure 65 UNSAFE_SUPPLEMENTAL_ONLY apply 1 32 - custom
+expect_failure 65 UNSAFE_SUPPLEMENTAL_ONLY apply 1 29,67,69 - custom
+expect_failure 65 UNSAFE_SUPPLEMENTAL_ONLY apply 1 - 75 custom
+expect_failure 65 UNSAFE_SUPPLEMENTAL_ONLY apply 1 - 29,76 custom
+expect_failure 65 UNSAFE_SUPPLEMENTAL_ONLY apply 1 - 80 custom
+expect_failure 65 UNSAFE_SUPPLEMENTAL_ONLY apply 1 - 81,82,83,84,86,89,95 custom
+expect_failure 65 UNSAFE_SUPPLEMENTAL_ONLY apply 1 - 75,80 custom
 expect_failure 65 INVALID_PROFILE_SELECTION apply 1 - 78 nsa
+expect_failure 65 INVALID_PROFILE_SELECTION apply 1 - 261 nsa
 expect_failure 65 INVALID_PROFILE_SELECTION apply 1 3 75 nsa
+expect_failure 65 INVALID_PROFILE_SELECTION apply 1 3 80 nsa
+expect_failure 65 INVALID_PROFILE_SELECTION apply 1 88 - nsa
 expect_failure 65 INVALID_BANDS apply 1 1,1 - custom
+expect_failure 65 INVALID_BANDS apply 1 15 - custom
+expect_failure 65 INVALID_BANDS apply 1 - 259 custom
 expect_failure 64 UNKNOWN_COMMAND unsupported
 
 # A malformed successful-looking helper response must fail closed instead of

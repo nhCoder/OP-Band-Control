@@ -1,5 +1,5 @@
 import { enableEdgeToEdge, hasKernelSUBridge, nativeToast, spawn } from './vendor/kernelsu.js';
-import { CPH2747_CATALOG, uniqueBands } from './catalog.js';
+import { uniqueBands } from './catalog.js';
 
 const MODULE_DIR = '/data/adb/modules/opbandcontrol';
 const BUSYBOX = '/data/adb/ksu/bin/busybox';
@@ -175,18 +175,28 @@ function mockStatus(state, requestedSubId) {
   const selectedSubId = [1, 2].includes(numericSubId)
     ? numericSubId
     : [1, 2].includes(Number(state.subId)) ? Number(state.subId) : 1;
+  const secondSim = selectedSubId === 2;
+  const serving = secondSim
+    ? [{ rat: 'LTE', band: 8, primary: true, registered: true, channel: 3500, pci: 84, bandwidthKhz: 10000, rsrp: -97, rsrq: -12, sinr: 11, level: 2 }]
+    : [
+      { rat: 'NR', band: 78, primary: false, registered: true, channel: 640000, pci: 431, bandwidthKhz: 100000, rsrp: -88, rsrq: -11, sinr: 19, level: 3 },
+      { rat: 'LTE', band: 3, primary: true, registered: true, channel: 1650, pci: 143, bandwidthKhz: 20000, rsrp: -91, rsrq: -10, sinr: 18, level: 3 },
+      { rat: 'LTE', band: 1, primary: false, registered: true, channel: 300, pci: 143, bandwidthKhz: 15000, rsrp: -96, rsrq: -13, sinr: 13, level: 2 },
+    ];
+  const observed = secondSim
+    ? { lte: [8, 28], nr: [] }
+    : { lte: [1, 3, 7, 8, 28, 40], nr: [28, 41, 78] };
   return {
     ok: true,
     timestamp: Date.now(),
     preview: true,
     device: {
-      model: 'CPH2747',
-      product: 'OP15 Global',
-      manufacturer: 'OnePlus',
+      model: 'Demo device',
+      product: 'generic_runtime',
+      manufacturer: 'Android',
       sdk: 36,
       release: '16',
-      rom: 'OxygenOS',
-      conversionHint: 'Reported model only · original hardware SKU unverified',
+      rom: 'Android',
     },
     subscriptions: [
       { subId: 1, slotIndex: 0, carrierName: 'Demo carrier', displayName: 'SIM 1', defaultData: true },
@@ -194,16 +204,32 @@ function mockStatus(state, requestedSubId) {
     ],
     selectedSubId,
     connected: true,
-    mode: '5G NSA',
+    mode: secondSim ? 'LTE' : '5G NSA',
     signalLevel: 3,
-    carrierAggregationActive: true,
-    serving: [
-      { rat: 'NR', band: 78, primary: false, registered: true, channel: 640000, pci: 431, bandwidthKhz: 100000, rsrp: -88, rsrq: -11, sinr: 19, level: 3 },
-      { rat: 'LTE', band: 3, primary: true, registered: true, channel: 1650, pci: 143, bandwidthKhz: 20000, rsrp: -91, rsrq: -10, sinr: 18, level: 3 },
-      { rat: 'LTE', band: 1, primary: false, registered: true, channel: 300, pci: 143, bandwidthKhz: 15000, rsrp: -96, rsrq: -13, sinr: 13, level: 2 },
-    ],
-    observed: { lte: [1, 3, 7, 8, 28, 40], nr: [28, 41, 78] },
-    catalog: { lte: [...CPH2747_CATALOG.lte], nr: [...CPH2747_CATALOG.nr], source: 'OnePlus CPH2747 certification' },
+    carrierAggregationActive: !secondSim,
+    serving,
+    observed,
+    discoveredBands: {
+      serving: {
+        lte: uniqueBands(serving.filter((item) => item.rat === 'LTE').map((item) => item.band)),
+        nr: uniqueBands(serving.filter((item) => item.rat === 'NR').map((item) => item.band)),
+      },
+      observed,
+      selection: { lte: selectionLte, nr: selectionNr },
+      all: {
+        lte: uniqueBands([...observed.lte, ...selectionLte, ...serving.filter((item) => item.rat === 'LTE').map((item) => item.band)]),
+        nr: uniqueBands([...observed.nr, ...selectionNr, ...serving.filter((item) => item.rat === 'NR').map((item) => item.band)]),
+      },
+    },
+    inputPolicy: {
+      lte: [1, 3, 7, 8, 28, 29, 32, 40, 66],
+      nr: [28, 29, 41, 75, 76, 78, 80],
+      supplementalDownlinkLte: [29, 32],
+      supplementalDownlinkNr: [29, 75, 76],
+      supplementalUplinkNr: [80],
+      basis: 'Preview subset of the Android input policy',
+      deviceCapabilityClaim: false,
+    },
     selection: { auto, lte: selectionLte, nr: selectionNr },
     capability: {
       read: true,

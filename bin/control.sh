@@ -23,17 +23,20 @@ APP_PROCESS=${OPBAND_APP_PROCESS:-app_process}
 PATH="/data/adb/ksu/bin:/data/adb/magisk:/system/bin:/system/xbin:$PATH"
 export PATH
 
-LTE_ALLOWED_CSV=1,2,3,4,5,7,8,12,13,17,18,19,20,25,26,28,30,32,34,38,39,40,41,42,48,66,71
-NR_ALLOWED_CSV=1,2,3,5,7,8,12,13,20,25,26,28,30,38,40,41,48,66,71,75,77,78
-LTE_ALLOWED_WORDS='1 2 3 4 5 7 8 12 13 17 18 19 20 25 26 28 30 32 34 38 39 40 41 42 48 66 71'
-NR_ALLOWED_WORDS='1 2 3 5 7 8 12 13 20 25 26 28 30 38 40 41 48 66 71 75 77 78'
+# Finite 3GPP/Android band identifiers accepted as mutation input. These are a
+# syntax and safety policy, not a claim that the current modem supports them.
+# Actual bands reported at runtime are returned by the helper status command.
+LTE_ALLOWED_CSV=1,2,3,4,5,6,7,8,9,10,11,12,13,14,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,65,66,67,68,69,70,71,72,73,74,85,87,88
+NR_ALLOWED_CSV=1,2,3,5,7,8,12,14,18,20,25,26,28,29,30,34,38,39,40,41,46,48,50,51,53,65,66,70,71,74,75,76,77,78,79,80,81,82,83,84,86,89,90,91,92,93,94,95,96,257,258,260,261
+LTE_ALLOWED_WORDS='1 2 3 4 5 6 7 8 9 10 11 12 13 14 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 65 66 67 68 69 70 71 72 73 74 85 87 88'
+NR_ALLOWED_WORDS='1 2 3 5 7 8 12 14 18 20 25 26 28 29 30 34 38 39 40 41 46 48 50 51 53 65 66 70 71 74 75 76 77 78 79 80 81 82 83 84 86 89 90 91 92 93 94 95 96 257 258 260 261'
 
 LOCK_MODE=
 LOCK_OWNER=
 HELPER_OUTPUT=
 HELPER_RC=0
 NORMALIZED=
-NON_SDL_COUNT=0
+ORDINARY_BAND_COUNT=0
 
 ensure_state_dir() {
     [ -d "$STATE_DIR" ] || mkdir -p "$STATE_DIR" 2>/dev/null || return 1
@@ -371,7 +374,7 @@ normalize_band_csv() {
     return 0
 }
 
-count_non_sdl_bands() {
+count_ordinary_bands() {
     local rat csv old_ifs band count
     rat=$1
     csv=$2
@@ -383,12 +386,12 @@ count_non_sdl_bands() {
         IFS=$old_ifs
         for band in "$@"; do
             case "$rat:$band" in
-                lte:32|nr:75) ;;
+                lte:29|lte:32|lte:67|lte:69|nr:29|nr:75|nr:76|nr:80|nr:81|nr:82|nr:83|nr:84|nr:86|nr:89|nr:95) ;;
                 *) count=$((count + 1)) ;;
             esac
         done
     fi
-    NON_SDL_COUNT=$count
+    ORDINARY_BAND_COUNT=$count
 }
 
 csv_json_array() {
@@ -611,7 +614,7 @@ command_selection() {
 command_apply() {
     local requested_sub profile lte nr active_pending sub_id pre_restore previous_profile
     local previous_lte previous_nr previous_applied previous_sub token now expires apply_output fields
-    local lte_anchor_count nr_uplink_count
+    local lte_anchor_count nr_ordinary_count
     requested_sub=
     profile=custom
     case "$#" in
@@ -644,10 +647,10 @@ command_apply() {
     [ "$profile" != adaptive ] \
         || die_json INVALID_PROFILE 'The adaptive profile must use reset' 65
     normalize_band_csv lte "$lte" \
-        || die_json INVALID_BANDS 'LTE bands are not a unique subset of the CPH2747 catalog' 65
+        || die_json INVALID_BANDS 'LTE bands must be unique identifiers in the standards-level input allowlist' 65
     lte=$NORMALIZED
     normalize_band_csv nr "$nr" \
-        || die_json INVALID_BANDS 'NR bands are not a unique subset of the CPH2747 catalog' 65
+        || die_json INVALID_BANDS 'NR bands must be unique identifiers in the standards-level input allowlist' 65
     nr=$NORMALIZED
 
     # Older WebUI versions submitted lte-plus as a numbered LTE band
@@ -663,18 +666,18 @@ command_apply() {
     [ "$lte" != - ] || [ "$nr" != - ] \
         || die_json EMPTY_SELECTION_REQUIRES_RESET 'Use reset for an automatic/empty selection' 65
 
-    count_non_sdl_bands lte "$lte"
-    lte_anchor_count=$NON_SDL_COUNT
-    count_non_sdl_bands nr "$nr"
-    nr_uplink_count=$NON_SDL_COUNT
-    [ $((lte_anchor_count + nr_uplink_count)) -gt 0 ] \
-        || die_json UNSAFE_SDL_ONLY 'B32 and n75 cannot be the only selected bands' 65
+    count_ordinary_bands lte "$lte"
+    lte_anchor_count=$ORDINARY_BAND_COUNT
+    count_ordinary_bands nr "$nr"
+    nr_ordinary_count=$ORDINARY_BAND_COUNT
+    [ $((lte_anchor_count + nr_ordinary_count)) -gt 0 ] \
+        || die_json UNSAFE_SUPPLEMENTAL_ONLY 'Supplemental downlink/uplink bands cannot be the entire selection; include an ordinary LTE or NR serving band' 65
     case "$profile" in
         nsa)
             [ "$lte_anchor_count" -ge 1 ] \
                 || die_json INVALID_PROFILE_SELECTION '5G NSA candidate requires an LTE anchor band' 65
-            [ "$nr_uplink_count" -ge 1 ] \
-                || die_json INVALID_PROFILE_SELECTION '5G NSA candidate requires a non-SDL NR band' 65
+            [ "$nr_ordinary_count" -ge 1 ] \
+                || die_json INVALID_PROFILE_SELECTION '5G NSA candidate requires a non-supplemental NR band' 65
             ;;
     esac
 

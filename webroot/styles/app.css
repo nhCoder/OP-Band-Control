@@ -788,6 +788,41 @@ select:focus-visible,
   border-color: var(--accent-bright);
 }
 
+.band-identity {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+}
+
+.candidate-origin {
+  overflow: hidden;
+  max-width: 72px;
+  color: var(--muted);
+  font-size: 8px;
+  font-weight: 560;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.band-option[aria-pressed="true"] .candidate-origin {
+  color: rgba(255, 255, 255, 0.78);
+}
+
+.band-empty {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 16px;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .band-option[disabled] {
   color: #656b70;
   background: #0f1112;
@@ -860,6 +895,15 @@ select:focus-visible,
 
 .profile-option:last-child {
   border-bottom: 0;
+}
+
+.profile-option:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.profile-option:disabled .profile-effect {
+  color: var(--muted);
 }
 
 .profile-radio {

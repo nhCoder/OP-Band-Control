@@ -160,11 +160,16 @@ final class TelephonyBackend {
         root.put("signalLevel", overallSignalLevel);
         root.put("serving", live.serving);
 
+        BandDiscovery bandDiscovery = discoverBands(live, specifiers);
         Map<String, Object> observed = new LinkedHashMap<>();
         observed.put("lte", new ArrayList<>(live.observedLte));
         observed.put("nr", new ArrayList<>(live.observedNr));
         root.put("observed", observed);
-        root.put("catalog", catalog());
+        root.put("discoveredBands", bandDiscovery.json());
+        // Keep catalog as a compatibility view for existing WebUIs. Unlike the
+        // old device-specific list, it contains only bands discovered at runtime.
+        root.put("catalog", bandDiscovery.catalogJson());
+        root.put("inputPolicy", inputPolicy());
         root.put("selection", selectionJson(specifiers));
         boolean telemetryRead = live.cellReadSucceeded || live.physicalReadSucceeded
                 || dataStateRead || dataNetworkTypeRead || voiceNetworkTypeRead
@@ -251,12 +256,19 @@ final class TelephonyBackend {
             throws Exception {
         SubscriptionSnapshot snapshot = readSubscriptions();
         int subId = requireSubId(requestedSubId, snapshot);
-        int[] lte = parseCatalogBands(lteCsv, Catalog.LTE_SET, "LTE");
-        int[] nr = parseCatalogBands(nrCsv, Catalog.NR_SET, "NR");
+        int[] lte = parseInputBands(lteCsv, BandPolicy.LTE_INPUT_SET, "LTE");
+        int[] nr = parseInputBands(nrCsv, BandPolicy.NR_INPUT_SET, "NR");
         if (lte.length == 0 && nr.length == 0) {
             throw commandError(
                     "EMPTY_SELECTION_REQUIRES_RESET",
                     "An empty selection is only permitted through reset",
+                    65);
+        }
+        if (!hasOrdinaryServingBand(lte, nr)) {
+            throw commandError(
+                    "UNSAFE_SUPPLEMENTAL_ONLY",
+                    "A selection made only from supplemental downlink/uplink bands "
+                            + "cannot provide standalone service",
                     65);
         }
 
@@ -384,7 +396,7 @@ final class TelephonyBackend {
         addCandidate(snapshot, snapshot.baseTelephonySubId, "base-telephony");
 
         // Information-list APIs use different permission and visibility paths on
-        // various Android/OxygenOS releases, so query each independently.
+        // different Android and OEM releases, so query each independently.
         collectSubscriptionInfoList(snapshot, "getActiveSubscriptionInfoList", true);
         collectSubscriptionInfoList(snapshot, "getCompleteActiveSubscriptionInfoList", true);
         collectSubscriptionInfoList(snapshot, "getAllSubscriptionInfoList", false);
@@ -412,7 +424,7 @@ final class TelephonyBackend {
         });
         int slotCount = Math.max(activeModems, Math.max(phoneCount, supportedModems));
         // A broken count API must not prevent probing the two logical slots common
-        // on OnePlus. Invalid slot queries safely return null/-1.
+        // on dual-SIM Android devices. Invalid slot queries safely return null/-1.
         if (slotCount <= 0) slotCount = 2;
         slotCount = Math.min(slotCount, 4);
         snapshot.diagnostics.put("activeModemCount", activeModems);
@@ -973,7 +985,7 @@ final class TelephonyBackend {
         return new Main.CommandException(code, message, exitCode);
     }
 
-    private static int[] parseCatalogBands(String csv, Set<Integer> allowed, String rat)
+    private static int[] parseInputBands(String csv, Set<Integer> allowed, String rat)
             throws Main.CommandException {
         if ("-".equals(csv)) return new int[0];
         if (csv == null || csv.length() > 256 || !csv.matches("[0-9]+(,[0-9]+)*")) {
@@ -991,7 +1003,8 @@ final class TelephonyBackend {
             if (!String.valueOf(band).equals(token) || !allowed.contains(band)) {
                 throw new Main.CommandException(
                         "UNSUPPORTED_BAND",
-                        rat + " band " + token + " is not in the official CPH2747 catalog",
+                        rat + " band " + token
+                                + " is not in the standards-level input allowlist",
                         65);
             }
             if (!result.add(band)) {
@@ -1087,6 +1100,19 @@ final class TelephonyBackend {
         return values;
     }
 
+    private static boolean hasOrdinaryServingBand(int[] lte, int[] nr) {
+        for (int band : lte) {
+            if (!BandPolicy.LTE_SUPPLEMENTAL_DOWNLINK_SET.contains(band)) return true;
+        }
+        for (int band : nr) {
+            if (!BandPolicy.NR_SUPPLEMENTAL_DOWNLINK_SET.contains(band)
+                    && !BandPolicy.NR_SUPPLEMENTAL_UPLINK_SET.contains(band)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static int strictInt(String token, int minimum, int maximum, String label)
             throws Main.CommandException {
         if (!token.matches("0|[1-9][0-9]*")) {
@@ -1152,6 +1178,7 @@ final class TelephonyBackend {
         }
 
         for (CellInfo info : cellInfos) {
+            addIdentityBands(live, info);
             CellReading reading = readCell(info);
             if (reading == null) continue;
             live.cells.add(reading.json());
@@ -1170,6 +1197,22 @@ final class TelephonyBackend {
             }
         }
         return live;
+    }
+
+    private static void addIdentityBands(LiveRadio live, CellInfo info) {
+        try {
+            if (info instanceof CellInfoLte) {
+                addObservedBands(
+                        live, "LTE", ((CellInfoLte) info).getCellIdentity().getBands());
+            } else if (info instanceof CellInfoNr) {
+                addObservedBands(
+                        live, "NR",
+                        ((CellIdentityNr) ((CellInfoNr) info).getCellIdentity()).getBands());
+            }
+        } catch (Throwable ignored) {
+            // Keep the representative CellReading path available if an OEM
+            // identity exposes a malformed multi-band array.
+        }
     }
 
     private static List<PhysicalChannelConfig> physicalChannels(TelephonyManager telephony)
@@ -1254,6 +1297,7 @@ final class TelephonyBackend {
                 CellReading reading = null;
                 if (identity instanceof CellIdentityLte) {
                     CellIdentityLte lte = (CellIdentityLte) identity;
+                    addObservedBands(live, "LTE", lte.getBands());
                     reading = new CellReading(
                             "LTE", firstBand(lte.getBands()), true,
                             CellInfo.CONNECTION_PRIMARY_SERVING,
@@ -1263,6 +1307,7 @@ final class TelephonyBackend {
                             null, null, null, null);
                 } else if (identity instanceof CellIdentityNr) {
                     CellIdentityNr nr = (CellIdentityNr) identity;
+                    addObservedBands(live, "NR", nr.getBands());
                     reading = new CellReading(
                             "NR", firstBand(nr.getBands()), true,
                             CellInfo.CONNECTION_PRIMARY_SERVING,
@@ -1358,6 +1403,13 @@ final class TelephonyBackend {
         if ("NR".equals(rat)) live.observedNr.add(band);
     }
 
+    private static void addObservedBands(LiveRadio live, String rat, int[] bands) {
+        if (bands == null) return;
+        for (int band : bands) {
+            if (band > 0) addObserved(live, rat, band);
+        }
+    }
+
     private static String mode(
             List<Map<String, Object>> serving,
             int networkType,
@@ -1386,40 +1438,69 @@ final class TelephonyBackend {
                 + config.getPhysicalCellId();
     }
 
-    private Map<String, Object> device() {
-        String model = string(Build.MODEL);
-        String product = string(Build.PRODUCT);
-        String manufacturer = string(Build.MANUFACTURER);
-        String oplusModel = systemProperty("ro.vendor.oplus.market.name", "");
-        String conversionHint;
-        if ("CPH2747".equalsIgnoreCase(model)
-                || "CPH2747".equalsIgnoreCase(systemProperty("ro.product.model", ""))) {
-            conversionHint = "CPH2747 identity reported";
-        } else if (manufacturer.toLowerCase().contains("oneplus")
-                || product.toLowerCase().contains("oneplus")
-                || oplusModel.toLowerCase().contains("oneplus 15")) {
-            conversionHint =
-                    "OnePlus device without CPH2747 identity; verify converted hardware before applying";
-        } else {
-            conversionHint = "Non-CPH2747 device; catalog compatibility is not established";
+    private static BandDiscovery discoverBands(
+            LiveRadio live, List<RadioAccessSpecifier> specifiers) {
+        BandDiscovery discovery = new BandDiscovery();
+        discovery.observedLte.addAll(live.observedLte);
+        discovery.observedNr.addAll(live.observedNr);
+
+        for (Map<String, Object> carrier : live.serving) {
+            Object rat = carrier.get("rat");
+            Object rawBand = carrier.get("band");
+            if (!(rawBand instanceof Number)) continue;
+            int band = ((Number) rawBand).intValue();
+            if (band <= 0) continue;
+            if ("LTE".equals(rat)) discovery.servingLte.add(band);
+            if ("NR".equals(rat)) discovery.servingNr.add(band);
         }
+
+        if (specifiers != null) {
+            for (RadioAccessSpecifier specifier : specifiers) {
+                int ran = specifier.getRadioAccessNetwork();
+                int[] bands = specifier.getBands();
+                if (bands == null) continue;
+                for (int band : bands) {
+                    if (band <= 0) continue;
+                    if (ran == RAN_EUTRAN) discovery.selectionLte.add(band);
+                    if (ran == RAN_NGRAN) discovery.selectionNr.add(band);
+                }
+            }
+        }
+
+        discovery.allLte.addAll(discovery.servingLte);
+        discovery.allLte.addAll(discovery.observedLte);
+        discovery.allLte.addAll(discovery.selectionLte);
+        discovery.allNr.addAll(discovery.servingNr);
+        discovery.allNr.addAll(discovery.observedNr);
+        discovery.allNr.addAll(discovery.selectionNr);
+        return discovery;
+    }
+
+    private Map<String, Object> device() {
         Map<String, Object> value = new LinkedHashMap<>();
-        value.put("model", model);
-        value.put("product", product);
-        value.put("manufacturer", manufacturer);
+        value.put("model", string(Build.MODEL));
+        value.put("product", string(Build.PRODUCT));
+        value.put("manufacturer", string(Build.MANUFACTURER));
+        value.put("brand", string(Build.BRAND));
+        value.put("device", string(Build.DEVICE));
+        value.put("hardware", string(Build.HARDWARE));
         value.put("sdk", Build.VERSION.SDK_INT);
         value.put("release", string(Build.VERSION.RELEASE));
         value.put("rom", string(Build.DISPLAY));
-        value.put("conversionHint", conversionHint);
+        value.put("buildId", string(Build.ID));
+        value.put("incremental", string(Build.VERSION.INCREMENTAL));
         return value;
     }
 
-    private static Map<String, Object> catalog() {
+    private static Map<String, Object> inputPolicy() {
         Map<String, Object> value = new LinkedHashMap<>();
-        value.put("lte", ints(Catalog.LTE));
-        value.put("nr", ints(Catalog.NR));
-        value.put("source", Catalog.SOURCE);
-        value.put("sourceUrl", Catalog.SOURCE_URL);
+        value.put("lte", ints(BandPolicy.LTE_INPUTS));
+        value.put("nr", ints(BandPolicy.NR_INPUTS));
+        value.put("supplementalDownlinkLte", ints(BandPolicy.LTE_SUPPLEMENTAL_DOWNLINK));
+        value.put("supplementalDownlinkNr", ints(BandPolicy.NR_SUPPLEMENTAL_DOWNLINK));
+        value.put("supplementalUplinkNr", ints(BandPolicy.NR_SUPPLEMENTAL_UPLINK));
+        value.put("basis", BandPolicy.BASIS);
+        value.put("deviceCapabilityClaim", false);
         return value;
     }
 
@@ -1475,17 +1556,6 @@ final class TelephonyBackend {
             return true;
         } catch (Throwable ignored) {
             return false;
-        }
-    }
-
-    private static String systemProperty(String key, String fallback) {
-        try {
-            Class<?> properties = Class.forName("android.os.SystemProperties");
-            Method get = properties.getMethod("get", String.class, String.class);
-            Object value = get.invoke(null, key, fallback);
-            return value == null ? fallback : String.valueOf(value);
-        } catch (Throwable ignored) {
-            return fallback;
         }
     }
 
@@ -1602,6 +1672,41 @@ final class TelephonyBackend {
         int physicalLteSecondaryCount;
         String cellError;
         String physicalError;
+    }
+
+    private static final class BandDiscovery {
+        final Set<Integer> servingLte = new TreeSet<>();
+        final Set<Integer> servingNr = new TreeSet<>();
+        final Set<Integer> observedLte = new TreeSet<>();
+        final Set<Integer> observedNr = new TreeSet<>();
+        final Set<Integer> selectionLte = new TreeSet<>();
+        final Set<Integer> selectionNr = new TreeSet<>();
+        final Set<Integer> allLte = new TreeSet<>();
+        final Set<Integer> allNr = new TreeSet<>();
+
+        Map<String, Object> json() {
+            Map<String, Object> value = new LinkedHashMap<>();
+            value.put("serving", pair(servingLte, servingNr));
+            value.put("observed", pair(observedLte, observedNr));
+            value.put("selection", pair(selectionLte, selectionNr));
+            value.put("all", pair(allLte, allNr));
+            return value;
+        }
+
+        Map<String, Object> catalogJson() {
+            Map<String, Object> value = pair(allLte, allNr);
+            value.put("source", "Runtime serving, observed, and current-selection data");
+            value.put("dynamic", true);
+            return value;
+        }
+
+        private static Map<String, Object> pair(
+                Set<Integer> lte, Set<Integer> nr) {
+            Map<String, Object> value = new LinkedHashMap<>();
+            value.put("lte", new ArrayList<>(lte));
+            value.put("nr", new ArrayList<>(nr));
+            return value;
+        }
     }
 
     private interface SubIdReader {
